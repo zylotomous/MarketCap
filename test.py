@@ -100,60 +100,6 @@ print(candles_df.columns.tolist())
 candles_df["date"] = pd.to_datetime(candles_df["end_period_ts"], unit="s", utc=True)
 print(candles_df[["meeting", "date", "price.close"]].head())
 
-""" Extracting may 23 decision - Hike 25bp"""
-
-may23_market = candles_df[candles_df["meeting"] == "FEDDECISION-23MAY"].reset_index(drop=True)
-
-may23_market["date"] = pd.to_datetime(may23_market["date"]).dt.normalize().dt.tz_localize(None)
-
-dff_may23 = dff_df.reset_index().rename(columns={"index": "date"})
-
-zq_may23 = tv.get_hist(
-    symbol='ZQK2023',
-    exchange='CBOT',
-    interval=Interval.in_daily,
-    n_bars=5000  # go back far enough to guarantee coverage of a 2023 date
-)
-
-zq_may23 = zq_may23.reset_index()
-
-zq_may23["date"] = pd.to_datetime(zq_may23["datetime"]).dt.normalize().dt.tz_localize(None)
-
-may23_merged = pd.merge(may23_market, dff_may23, on = "date", how = "left")
-may23_merged = pd.merge(may23_merged, zq_may23[["date", "close"]], on = "date", how = "left")
-may23_merged["close"] = may23_merged["close"].ffill()
-may23_merged["implied_prob"] = implied_probability_from_futures(
-    price=may23_merged["close"],
-    current_rate=may23_merged["DFF"],
-    move_bp=0.25,
-    days_in_month=31,
-    meeting_day=3
-)
-may23_merged["kalshi_prob"] = (may23_merged["yes_ask.close"].astype(float) + may23_merged["yes_bid.close"].astype(float)) / 2
-
-
-fig, ax = plt.subplots(figsize=(10, 5))
-
-ax.plot(may23_merged["date"], may23_merged["kalshi_prob"], label="Kalshi probability", marker="o", markersize=3)
-ax.plot(may23_merged["date"], may23_merged["implied_prob"], label="ZQ implied probability", marker="o", markersize=3)
-
-ax.axhline(1.0, color="gray", linestyle="--", linewidth=0.8)
-ax.axhline(0.0, color="gray", linestyle="--", linewidth=0.8)
-
-ax.set_xlabel("Date")
-ax.set_ylabel("Implied probability")
-ax.set_title("Kalshi vs ZQ implied probability — May 2023 FOMC meeting")
-ax.legend()
-plt.xticks(rotation=45)
-plt.tight_layout()
-plt.show()
-
-may23_test = pull_and_compare(
-    meeting_name="FEDDECISION-23MAY",
-    dff_df=dff_df,
-    candles_df=candles_df)
-
-
 """
 A list of all the fed decision rates
 Pulling: FEDDECISION-23MAY
@@ -195,3 +141,91 @@ for meeting in meeting_tickers:
         dff_df=dff_df,
         candles_df=candles_df
     ))
+
+
+print("All meetintgs pulled")
+
+historical_kalshi_vs_futures_df = pd.concat(historical_kalshi_vs_futures, ignore_index=True)
+
+# ── 1. Spread over time, aligned by days-before-meeting ──────────────────────
+meeting_dates = (
+    historical_kalshi_vs_futures_df
+    .groupby("meeting")["date"]
+    .max()
+    .rename("meeting_date")
+)
+df = historical_kalshi_vs_futures_df.join(meeting_dates, on="meeting")
+df["days_before"] = (df["meeting_date"] - df["date"]).dt.days
+
+fig, ax = plt.subplots(figsize=(12, 5))
+for meeting, grp in df.groupby("meeting"):
+    grp_sorted = grp.sort_values("days_before", ascending=False)
+    ax.plot(grp_sorted["days_before"], grp_sorted["spread_bp"],
+            alpha=0.6, linewidth=1, label=meeting)
+ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+ax.invert_xaxis()
+ax.set_xlabel("Days before meeting")
+ax.set_ylabel("Spread (bp)  [ZQ − Kalshi]")
+ax.set_title("ZQ vs Kalshi expected move spread — all meetings")
+ax.legend(fontsize=6, ncol=3, loc="upper left")
+plt.tight_layout()
+plt.show()
+
+# ── 2. Average spread per meeting ─────────────────────────────────────────────
+avg_spread = (
+    historical_kalshi_vs_futures_df
+    .groupby("meeting")["spread_bp"]
+    .mean()
+    .sort_values()
+)
+print("\nAverage spread (ZQ − Kalshi) by meeting:")
+print(avg_spread.to_string())
+
+fig, ax = plt.subplots(figsize=(10, 5))
+avg_spread.plot(kind="bar", ax=ax, color=["#d62728" if v < 0 else "#1f77b4" for v in avg_spread])
+ax.axhline(0, color="black", linewidth=0.8)
+ax.set_ylabel("Avg spread (bp)")
+ax.set_title("Average ZQ − Kalshi spread by meeting")
+plt.xticks(rotation=45, ha="right")
+plt.tight_layout()
+plt.show()
+
+# ── 3. Does spread converge near the meeting? ─────────────────────────────────
+spread_by_days = df.groupby("days_before")["spread_bp"].mean()
+fig, ax = plt.subplots(figsize=(10, 4))
+spread_by_days.sort_index(ascending=False).plot(ax=ax)
+ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+ax.invert_xaxis()
+ax.set_xlabel("Days before meeting")
+ax.set_ylabel("Avg spread (bp)")
+ax.set_title("Average spread convergence across all meetings")
+plt.tight_layout()
+plt.show()
+
+# ── 4. Cross-correlation: does Kalshi lead or lag futures? ────────────────────
+lags, corrs = [], []
+for meeting, grp in df.groupby("meeting"):
+    grp = grp.sort_values("date")
+    dk = grp["kalshi_expected_move_bp"].diff().dropna()
+    dz = grp["zq_expected_move_bp"].diff().dropna()
+    idx = dk.index.intersection(dz.index)
+    if len(idx) < 10:
+        continue
+    for lag in range(-5, 6):
+        shifted = dz.shift(lag).reindex(idx)
+        valid = dk.reindex(idx).notna() & shifted.notna()
+        if valid.sum() < 5:
+            continue
+        c = dk.reindex(idx)[valid].corr(shifted[valid])
+        lags.append(lag)
+        corrs.append(c)
+
+lag_df = pd.DataFrame({"lag": lags, "corr": corrs}).groupby("lag")["corr"].mean()
+fig, ax = plt.subplots(figsize=(8, 4))
+lag_df.plot(kind="bar", ax=ax)
+ax.axhline(0, color="black", linewidth=0.8)
+ax.set_xlabel("Lag (days, positive = ZQ leads Kalshi)")
+ax.set_ylabel("Avg cross-correlation")
+ax.set_title("Cross-correlation: daily changes in ZQ vs Kalshi expected move")
+plt.tight_layout()
+plt.show()

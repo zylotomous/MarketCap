@@ -141,22 +141,13 @@ def implied_probability_from_futures(price, current_rate, move_bp, days_in_month
 
     return p_hike
 
-def zq_expected_move_bp(price, current_rate, days_in_month, meeting_day,
-                        next_month_price=None):
+def zq_expected_move_bp(price, current_rate, days_in_month, meeting_day):
     """
-    Solves directly for the futures-implied EXPECTED rate change (in bp).
-
-    For late-month meetings (last 5 days), falls back to the next-month
-    contract where weight_after = 1 and there is no amplification problem:
-        expected_move = (100 - next_month_price) - current_rate
+    Solves directly for the futures-implied EXPECTED rate change (in bp),
+    no assumed move size needed. Works uniformly for hikes, cuts, and holds.
     """
-    post_meeting_days = days_in_month - meeting_day
-    weight_after = post_meeting_days / days_in_month
-    if weight_after < (5 / days_in_month):
-        if next_month_price is None:
-            return np.nan
-        return ((100 - next_month_price) - current_rate) * 100
     implied_avg_rate = 100 - price
+    weight_after = (days_in_month - meeting_day + 1) / days_in_month
     expected_move_bp = (implied_avg_rate - current_rate) / weight_after * 100
     return expected_move_bp
 
@@ -234,39 +225,16 @@ def pull_and_compare(meeting_name, dff_df, candles_df):
     merged_df = pd.merge(kalshi_daily, dff_reset, on="date", how="left")
     merged_df = pd.merge(merged_df, zq_market[["date", "close"]], on="date", how="left")
     merged_df["close"] = merged_df["close"].ffill()
-    merged_df["DFF"] = merged_df["DFF"].ffill()
 
     meeting_day, days_in_month = get_month_params(meeting_name, kalshi_daily["date"].iloc[-1])
-
-    # For late-month meetings, pull next month's contract (weight_after ≈ 1, no amplification)
-    next_month_price = None
-    if days_in_month - meeting_day < 5:
-        next_month = month % 12 + 1
-        next_year = year + (1 if month == 12 else 0)
-        try:
-            zq_next = get_zq_data_with_retry(
-                symbol=get_futures_symbol(next_year, next_month, root="ZQ"),
-                max_retries=3,
-                delay=2
-            )
-            zq_next = zq_next.reset_index()
-            zq_next["date"] = pd.to_datetime(zq_next["datetime"]).dt.normalize().dt.tz_localize(None)
-            merged_df = pd.merge(merged_df, zq_next[["date", "close"]].rename(columns={"close": "close_next"}),
-                                 on="date", how="left")
-            merged_df["close_next"] = merged_df["close_next"].ffill()
-            next_month_price = merged_df["close_next"]
-        except Exception as e:
-            print(f"Could not fetch next-month ZQ for {meeting_name}: {e}")
 
     merged_df["zq_expected_move_bp"] = zq_expected_move_bp(
         price=merged_df["close"],
         current_rate=merged_df["DFF"],
         days_in_month=days_in_month,
-        meeting_day=meeting_day,
-        next_month_price=next_month_price
+        meeting_day=meeting_day
     )
 
     merged_df["spread_bp"] = merged_df["zq_expected_move_bp"] - merged_df["kalshi_expected_move_bp"]
-    merged_df["meeting"] = meeting_name
 
     return merged_df
