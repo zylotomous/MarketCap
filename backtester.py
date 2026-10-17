@@ -8,12 +8,18 @@ import re
 from datetime import datetime
 import calendar
 import time
+import os
+import json
 
 
 fred = Fred(api_key='2fb076f73bbbf80577aa401592ca3110')
 tv = TvDatafeed()  # anonymous access works for delayed data on many symbols
 BASE = "https://external-api.kalshi.com/trade-api/v2"
 endpoint = f"{BASE}/historical/markets?series_ticker=KXFEDDECISION&limit=200&status=settled"
+
+# Disk cache for raw pulls, so a re-run does not hit TradingView/Kalshi again
+# and one dropped connection does not lose work already done.
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "cache")
 
 CME_MONTH_CODES = {
     1: "F", 2: "G", 3: "H", 4: "J", 5: "K", 6: "M",
@@ -25,27 +31,43 @@ def get_full_event_outcomes(event_ticker, historical_markets_df):
     """Returns all 5 outcome rows for a given meeting."""
     return historical_markets_df[historical_markets_df["event_ticker"] == event_ticker].copy()
 
-def kalshi_expected_move_bp(event_rows):
+def kalshi_expected_move_bp(event_rows, tail_move_bp=50):
     """
     Computes the probability-weighted expected rate change (in bp)
     implied by Kalshi's full outcome distribution for one meeting.
+
+    Kalshi's tail buckets represent outcomes beyond 25 bp rather than
+    an exact move. ``tail_move_bp`` is the representative move assigned
+    to those buckets for the expected-value calculation.
     """
-    total = 0
+    if tail_move_bp <= 25:
+        raise ValueError("tail_move_bp must be greater than 25 bp")
+
+    probs, moves = [], []
     for _, row in event_rows.iterrows():
-        direction, size = parse_outcome_from_ticker(row["ticker"])
-        prob = (float(row["yes_bid_dollars"]) + float(row["yes_ask_dollars"])) / 2
-        
+        direction, size = parse_outcome_from_ticker(
+            row["ticker"], tail_move_bp=tail_move_bp
+        )
         if direction == "hike":
             move = size
         elif direction == "cut":
             move = -size
         else:
             move = 0
-        
-        total += prob * move
-    return total
+        probs.append((float(row["yes_bid_dollars"]) + float(row["yes_ask_dollars"])) / 2)
+        moves.append(move)
 
-def parse_outcome_from_ticker(ticker):
+    # The outcome buckets are mutually exclusive and exhaustive, so the
+    # probabilities must sum to 1. Bid/ask mids sum to 1 ± a small spread error;
+    # normalizing removes that systematic bias from the expected value.
+    probs = np.asarray(probs, dtype=float)
+    denom = probs.sum()
+    if denom == 0:
+        return 0.0
+    probs = probs / denom
+    return float(np.dot(probs, moves))
+
+def parse_outcome_from_ticker(ticker, tail_move_bp=50):
     """
     Handles all observed Kalshi FOMC ticker suffix conventions:
       -H25, -C25        -> exact bp bucket
@@ -54,12 +76,16 @@ def parse_outcome_from_ticker(ticker):
       -TH50, -TC50      -> '>Xbp' threshold (May 2023 wide-range convention)
       -H0               -> hold
     """
+    if tail_move_bp <= 25:
+        raise ValueError("tail_move_bp must be greater than 25 bp")
+
     match = re.search(r'-(T?)([HC])(>?)(\d+)$', ticker)
     if not match:
         raise ValueError(f"Could not parse outcome from ticker: {ticker}")
 
     threshold_prefix, letter, threshold_gt, size = match.groups()
     size = int(size)
+    is_tail = bool(threshold_prefix or threshold_gt or size == 26)
 
     if letter == "H" and size == 0:
         direction = "hold"
@@ -68,7 +94,7 @@ def parse_outcome_from_ticker(ticker):
     else:
         direction = "cut"
 
-    return direction, size
+    return direction, tail_move_bp if is_tail else size
 
 def get_futures_symbol(year, month, root="ZQ"):
     code = CME_MONTH_CODES[month]
@@ -102,19 +128,48 @@ def get_kalshi_market(event_ticker, kalshi_df):
 
     return market
 
-def get_zq_data_with_retry(symbol, max_retries=3, delay=2):
+def get_zq_data_with_retry(symbol, max_retries=3, delay=2, use_cache=True):
+    """
+    Fetch one ZQ contract's daily history, retrying on failure and caching to
+    disk. The fix for the "connection lost / no data" loop: a brand-new
+    ``TvDatafeed()`` is created on every attempt. The module-level ``tv`` keeps
+    a dead websocket after TradingView drops the connection, so calling
+    ``tv.get_hist`` again on the same instance reuses that dead socket and keeps
+    failing. A fresh session re-establishes the connection.
+
+    Note: "no data, please check the exchange and symbol" is a *different*
+    symptom. If it persists across a fresh session, the symbol really has no
+    rows under anonymous access (most likely for an expired contract), not a
+    connection problem.
+    """
+    cache_path = os.path.join(CACHE_DIR, "zq", f"{symbol}.csv")
+    if use_cache and os.path.exists(cache_path):
+        cached = pd.read_csv(cache_path, index_col=0)
+        cached.index = pd.to_datetime(cached.index)
+        return cached
+
+    last_err = None
     for attempt in range(max_retries):
-        zq_market = tv.get_hist(
-            symbol=symbol,
-            exchange='CBOT',
-            interval=Interval.in_daily,
-            n_bars=5000
-        )
-        if zq_market is not None and not zq_market.empty:
-            return zq_market
-        print(f"Attempt {attempt+1} failed for {symbol}, retrying...")
-        time.sleep(delay)
-    raise ValueError(f"Could not fetch ZQ data for {symbol} after {max_retries} attempts")
+        try:
+            local_tv = TvDatafeed()
+            zq_market = local_tv.get_hist(
+                symbol=symbol,
+                exchange='CBOT',
+                interval=Interval.in_daily,
+                n_bars=5000
+            )
+            if zq_market is not None and not zq_market.empty:
+                if use_cache:
+                    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                    zq_market.to_csv(cache_path)
+                return zq_market
+            last_err = f"empty data for {symbol}"
+        except Exception as e:
+            last_err = repr(e)
+        print(f"Attempt {attempt+1} failed for {symbol} ({last_err}), retrying...")
+        time.sleep(delay * (attempt + 1))
+
+    raise ValueError(f"Could not fetch ZQ data for {symbol} after {max_retries} attempts (last: {last_err})")
 
 def get_kalshi_probability(kalshi_market):
     yes_bid = kalshi_market["yes_bid_dollars"].astype(float)
@@ -144,29 +199,67 @@ def implied_probability_from_futures(price, current_rate, move_bp, days_in_month
 def zq_expected_move_bp(price, current_rate, days_in_month, meeting_day,
                         next_month_price=None):
     """
-    Solves directly for the futures-implied EXPECTED rate change (in bp).
+    Futures-implied EXPECTED rate change (in bp) at the meeting.
 
-    For late-month meetings (last 5 days), falls back to the next-month
-    contract where weight_after = 1 and there is no amplification problem:
-        expected_move = (100 - next_month_price) - current_rate
+    Solving from the meeting-month contract alone,
+        EV = (100 - price - current_rate) / weight_after * 100,
+    amplifies every measurement error by 1/weight_after, which explodes for
+    late-month meetings (small weight_after). For those we use a calendar
+    spread against the NEXT-month contract instead, which divides by
+    (1 - weight_after) = meeting_day/days_in_month (large when weight_after is
+    small):
+        EV = ((100 - price_next) - (100 - price)) / (1 - weight_after) * 100.
+
+    This is only valid when the next month contains no meeting (otherwise its
+    contract embeds a second decision); the caller passes next_month_price=None
+    in that case and we fall back to the meeting-month formula.
     """
-    post_meeting_days = days_in_month - meeting_day
-    weight_after = post_meeting_days / days_in_month
-    if weight_after < (5 / days_in_month):
+    weight_after = (days_in_month - meeting_day) / days_in_month
+
+    if weight_after < 0.5:
         if next_month_price is None:
-            return np.nan
-        return ((100 - next_month_price) - current_rate) * 100
+            if weight_after <= 0:
+                return np.nan
+            return ((100 - price) - current_rate) / weight_after * 100
+        rate_m = 100 - price
+        rate_next = 100 - next_month_price
+        return (rate_next - rate_m) / (1 - weight_after) * 100
+
     implied_avg_rate = 100 - price
-    expected_move_bp = (implied_avg_rate - current_rate) / weight_after * 100
-    return expected_move_bp
+    return (implied_avg_rate - current_rate) / weight_after * 100
 
 
-def get_candlesticks(ticker, start_ts, end_ts, period_interval=1440):
+def _safe_cache_name(ticker):
+    """Replace characters that are illegal in Windows filenames (e.g. the '>'
+    in 'FEDDECISION-23JUN-H>25') so a cache path can be built from any ticker."""
+    return re.sub(r'[<>:"/\\|?*]', '_', ticker)
+
+
+def get_candlesticks(ticker, start_ts, end_ts, period_interval=1440, use_cache=True):
+    """
+    Kalshi candlestick history for one outcome contract, cached to disk keyed
+    by (ticker, start_ts, end_ts) so a re-run is a local read.
+    """
+    cache_path = os.path.join(CACHE_DIR, "kalshi", f"{_safe_cache_name(ticker)}_{start_ts}_{end_ts}.json")
+    if use_cache and os.path.exists(cache_path):
+        with open(cache_path) as fh:
+            return json.load(fh)
+
     url = f"{BASE}/historical/markets/{ticker}/candlesticks"
     params = {"start_ts": start_ts, "end_ts": end_ts, "period_interval": period_interval}
     r = requests.get(url, params=params)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+
+    if use_cache:
+        # A cache-write failure must never discard a successful fetch.
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, "w") as fh:
+                json.dump(data, fh)
+        except Exception as e:
+            print(f"Could not cache {ticker}: {e}")
+    return data
 
 def pull_candlesticks_for_event(event_ticker, close_time, lookback_days=60, historical_markets_df=None):
     """
@@ -199,7 +292,7 @@ def pull_candlesticks_for_event(event_ticker, close_time, lookback_days=60, hist
 # from tradingview and fred, meaning we need to do some data processing in
 # this pull and compare function itself 
 
-def compute_daily_kalshi_expected_move(candles_df, meeting_name):
+def compute_daily_kalshi_expected_move(candles_df, meeting_name, tail_move_bp=50):
     meeting_candles = candles_df[candles_df["meeting"] == meeting_name].copy()
     meeting_candles["date"] = pd.to_datetime(meeting_candles["end_period_ts"], unit="s", utc=True).dt.normalize().dt.tz_localize(None)
 
@@ -211,12 +304,50 @@ def compute_daily_kalshi_expected_move(candles_df, meeting_name):
 
     daily_results = []
     for date, group in meeting_candles.groupby("date"):
-        move_bp = kalshi_expected_move_bp(group)
-        daily_results.append({"date": date, "kalshi_expected_move_bp": move_bp})
+        move_bp = kalshi_expected_move_bp(group, tail_move_bp=tail_move_bp)
+        bid = pd.to_numeric(group["yes_bid_dollars"], errors="coerce")
+        ask = pd.to_numeric(group["yes_ask_dollars"], errors="coerce")
+        mids = (bid + ask) / 2
+        quote_spreads = ask - bid
+
+        liquid_bucket = mids > 0.05
+        wide_quote = (quote_spreads > 0.10) & liquid_bucket
+        missing_quote = liquid_bucket & (bid.isna() | ask.isna())
+
+        if "volume" in group:
+            volume = pd.to_numeric(group["volume"], errors="coerce")
+            total_volume = volume.sum(min_count=1)
+            zero_volume = liquid_bucket & (volume.fillna(0) <= 0)
+        else:
+            total_volume = np.nan
+            zero_volume = pd.Series(False, index=group.index)
+
+        daily_results.append({
+            "date": date,
+            "kalshi_expected_move_bp": move_bp,
+            "max_quote_spread": quote_spreads[liquid_bucket].max(),
+            "total_volume": total_volume,
+            "illiquid": bool((wide_quote | missing_quote | zero_volume).any()),
+        })
 
     return pd.DataFrame(daily_results)
 
-def pull_and_compare(meeting_name, dff_df, candles_df):
+def pull_and_compare(meeting_name, dff_df, candles_df, tail_move_bp=50,
+                     prev_decision_date=None, meeting_date=None, meeting_months=None):
+    """
+    prev_decision_date: date of the previous FOMC decision. Observations on or
+    before it are dropped: the meeting-month ZQ contract still embeds that
+    earlier decision, while DFF has not yet moved, so the spread is spurious.
+
+    meeting_date: the actual decision/settlement date, used for the day-count
+    (more robust than inferring it from the last candle). If None, the last
+    candle date is used as a fallback.
+
+    meeting_months: optional set of (year, month) tuples that contain an FOMC
+    meeting. Used to decide whether the NEXT-month contract is a clean anchor
+    for the calendar-spread estimate of late-month meetings (it is not, if the
+    next month has a meeting of its own).
+    """
     year, month = parse_meeting_ticker(meeting_name)
 
     zq_market = get_zq_data_with_retry(
@@ -229,20 +360,33 @@ def pull_and_compare(meeting_name, dff_df, candles_df):
 
     dff_reset = dff_df.reset_index().rename(columns={"index": "date"})
 
-    kalshi_daily = compute_daily_kalshi_expected_move(candles_df, meeting_name)
+    kalshi_daily = compute_daily_kalshi_expected_move(
+        candles_df, meeting_name, tail_move_bp=tail_move_bp
+    )
+    if prev_decision_date is not None:
+        kalshi_daily = kalshi_daily[kalshi_daily["date"] > prev_decision_date].reset_index(drop=True)
 
     merged_df = pd.merge(kalshi_daily, dff_reset, on="date", how="left")
     merged_df = pd.merge(merged_df, zq_market[["date", "close"]], on="date", how="left")
     merged_df["close"] = merged_df["close"].ffill()
     merged_df["DFF"] = merged_df["DFF"].ffill()
 
-    meeting_day, days_in_month = get_month_params(meeting_name, kalshi_daily["date"].iloc[-1])
+    if meeting_date is None:
+        meeting_date = kalshi_daily["date"].iloc[-1]
+    meeting_day, days_in_month = get_month_params(meeting_name, meeting_date)
 
-    # For late-month meetings, pull next month's contract (weight_after ≈ 1, no amplification)
+    # For late-month meetings the meeting-month contract's weight_after is
+    # small, so its implied move is a noisy 1/weight_after amplification. Anchor
+    # on the NEXT-month contract via a calendar spread instead (see
+    # zq_expected_move_bp). Only valid if the next month has no meeting.
+    next_month = month % 12 + 1
+    next_year = year + (1 if month == 12 else 0)
+    next_has_meeting = (
+        meeting_months is not None and (next_year, next_month) in meeting_months
+    )
+    weight_after = (days_in_month - meeting_day) / days_in_month
     next_month_price = None
-    if days_in_month - meeting_day < 5:
-        next_month = month % 12 + 1
-        next_year = year + (1 if month == 12 else 0)
+    if weight_after < 0.5 and not next_has_meeting:
         try:
             zq_next = get_zq_data_with_retry(
                 symbol=get_futures_symbol(next_year, next_month, root="ZQ"),
